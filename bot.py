@@ -10,7 +10,7 @@ from datetime import time
 import pytz
 
 TOKEN = '7639729513:AAEoXUYk4sQDRWb03lt3VMWuXkFe1Bu7Zik'
-ALPHA_VANTAGE_API_KEY = '6IO85LUA6K3PISYB'  # твой ключ
+FINNHUB_API_KEY = 'd10toqhr01qse6le0l2gd10toqhr01qse6le0l30'
 
 logging.basicConfig(level=logging.INFO)
 
