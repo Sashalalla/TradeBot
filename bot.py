@@ -1,139 +1,112 @@
 import logging
-import pandas as pd
-import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters,
-    ContextTypes
+    ApplicationBuilder, CommandHandler, CallbackContext, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
 )
-from datetime import time
+from datetime import datetime, timedelta, time
 import pytz
+import finnhub
+import pandas as pd
 
+# === Конфигурация ===
 TOKEN = '7639729513:AAEoXUYk4sQDRWb03lt3VMWuXkFe1Bu7Zik'
 FINNHUB_API_KEY = 'd10toqhr01qse6le0l2gd10toqhr01qse6le0l30'
-
-logging.basicConfig(level=logging.INFO)
-
-main_menu = ReplyKeyboardMarkup([
-    [KeyboardButton("📊 Дай сделку"), KeyboardButton("📉 Завершить торговлю")],
-    [KeyboardButton("💱 Изменить валютную пару"), KeyboardButton("📈 Какой рынок сейчас?")]
-], resize_keyboard=True)
-
+SYMBOL = 'EUR_USD'
 users_to_monitor = set()
-SYMBOL = 'EURUSD'
-kiev_tz = pytz.timezone("Europe/Kyiv")
+kiev_tz = pytz.timezone('Europe/Kyiv')
 
+# === Finnhub клиент ===
+finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-def get_market_data(symbol):
-    url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={symbol[:3]}&to_symbol={symbol[3:]}&interval=1min&apikey={ALPHA_VANTAGE_API_KEY}"
-    response = requests.get(url)
-    data = response.json()
-    if "Time Series FX (1min)" not in data:
+# === Получение данных рынка ===
+def get_market_data(symbol='EUR_USD'):
+    try:
+        full_symbol = f'OANDA:{symbol.upper()}'
+        now = datetime.utcnow()
+        from_time = int((now - timedelta(hours=24)).timestamp())
+        to_time = int(now.timestamp())
+
+        res = finnhub_client.forex_candles(full_symbol, '5', _from=from_time, to=to_time)
+
+        if res['s'] != 'ok' or not res.get('t'):
+            print("❌ Нет данных от API")
+            return None
+
+        df = pd.DataFrame({
+            'timestamp': res['t'],
+            'open': res['o'],
+            'high': res['h'],
+            'low': res['l'],
+            'close': res['c'],
+            'volume': res['v']
+        })
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        df.set_index('timestamp', inplace=True)
+        return df
+
+    except Exception as e:
+        print(f"Ошибка при получении данных: {e}")
         return None
-    df = pd.DataFrame.from_dict(data['Time Series FX (1min)'], orient='index')
-    df = df.rename(columns={
-        '1. open': 'open',
-        '2. high': 'high',
-        '3. low': 'low',
-        '4. close': 'close'
-    })
-    df = df.astype(float)
-    df = df.sort_index()
-    return df
 
-
+# === Анализ данных (простая логика) ===
 def analyze(df):
-    df['sma'] = df['close'].rolling(window=14).mean()
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
-    rs = avg_gain / avg_loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    latest = df.iloc[-1]
+    last = df['close'].iloc[-1]
+    prev = df['close'].iloc[-5]
+    direction = "BUY" if last > prev else "SELL"
+    confidence = round(abs(last - prev) / prev * 100, 2)
+    if confidence < 0.05:
+        return "WAIT", 0
+    return direction, min(confidence * 10, 99)
 
-    if latest['rsi'] < 30 and latest['close'] > latest['sma']:
-        return ("CALL", 85)
-    elif latest['rsi'] > 70 and latest['close'] < latest['sma']:
-        return ("PUT", 80)
-    else:
-        return ("WAIT", 50)
+# === Telegram обработчики ===
+async def start(update: Update, context: CallbackContext):
+    users_to_monitor.add(update.effective_chat.id)
+    keyboard = [
+        [InlineKeyboardButton("🚀 Начать торговлю", callback_data='start_trade')],
+        [InlineKeyboardButton("🛑 Закончить торговлю", callback_data='stop_trade')],
+        [InlineKeyboardButton("🔄 Продолжить торговлю", callback_data='continue_trade')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("👋 Привет! Выбери действие:", reply_markup=reply_markup)
 
+async def button(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'start_trade':
+        await query.edit_message_text(text="🚀 Торговля начата.")
+    elif query.data == 'stop_trade':
+        await query.edit_message_text(text="🛑 СТОП ТРЕЙД. Торговля завершена.")
+    elif query.data == 'continue_trade':
+        await query.edit_message_text(text="🔄 Продолжаем торговлю.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    users_to_monitor.add(chat_id)
-    await update.message.reply_text(
-        "👋 Привет! Я твой бот-напарник по трейду. Жми кнопки снизу ⬇",
-        reply_markup=main_menu
-    )
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: CallbackContext):
+    text = update.message.text.strip().upper()
     global SYMBOL
-    text = update.message.text
-    chat_id = update.effective_chat.id
-
-    if text == "📊 Дай сделку":
-        await update.message.reply_text("⏳ Анализирую рынок...")
-        df = get_market_data(SYMBOL)
-        if df is None:
-            await update.message.reply_text("⚠️ Не удалось получить данные.")
-            return
-        direction, confidence = analyze(df)
-        if direction == "WAIT" or confidence < 70:
-            await update.message.reply_text("🤔 Я не уверен в рынке сейчас. Лучше подождать.")
-        else:
-            await update.message.reply_text(
-                f"📢 Сигнал: {direction}\n💸 Валюта: {SYMBOL}\n⏱️ Время: 1-5 минут\n✅ Уверенность: {confidence}%"
-            )
-
-    elif text == "📉 Завершить торговлю":
-        users_to_monitor.discard(chat_id)
-        await update.message.reply_text("🛑 СТОП ТРЕЙД! Торговля завершена.")
-
-    elif text == "💱 Изменить валютную пару":
-        await update.message.reply_text("✍️ Введи валютную пару (например: GBPUSD):")
-        context.user_data['await_symbol'] = True
-
-    elif text == "📈 Какой рынок сейчас?":
-        df = get_market_data(SYMBOL)
-        if df is None:
-            await update.message.reply_text("⚠️ Не удалось получить данные.")
-            return
-        direction, confidence = analyze(df)
-        if confidence > 80:
-            mood = "✅ Спокойный и подходящий для входа"
-        elif confidence > 60:
-            mood = "⚠️ Средний — будь внимателен"
-        else:
-            mood = "🚨 Волатильный/опасный рынок"
-        await update.message.reply_text(
-            f"📊 Текущий рынок: {mood}\nПара: {SYMBOL}\nУверенность: {confidence}%"
-        )
-
-    elif context.user_data.get('await_symbol'):
-        SYMBOL = text.upper()
-        context.user_data['await_symbol'] = False
+    if text in ["EUR_USD", "GBP_USD", "USD_JPY"]:  # добавь другие пары
+        SYMBOL = text
         await update.message.reply_text(f"✅ Валютная пара установлена: {SYMBOL}")
-
+    elif "АНАЛИЗ" in text:
+        df = get_market_data(SYMBOL)
+        if df is None:
+            await update.message.reply_text("❌ Нет данных для анализа.")
+            return
+        direction, confidence = analyze(df)
+        await update.message.reply_text(f"📊 Сигнал: {direction}\nУверенность: {confidence}%")
     else:
-        await update.message.reply_text("😅 Не понял. Используй кнопки внизу.")
+        await update.message.reply_text("😅 Не понял. Используй кнопки или отправь название пары (например: EUR_USD).")
 
-
+# === Планировщики ===
 async def morning_analysis(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in users_to_monitor:
         df = get_market_data(SYMBOL)
         if df is not None:
             direction, confidence = analyze(df)
-            await context.bot.send_message(chat_id, f"🌅 Доброе утро!\nАнализ по {SYMBOL}: {direction}\nУверенность: {confidence}%")
-
+            await context.bot.send_message(chat_id, f"🌅 Доброе утро!\n📊 Анализ по {SYMBOL}:\nНаправление: {direction}\nУверенность: {confidence}%")
 
 async def evening_stop(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in users_to_monitor:
         await context.bot.send_message(chat_id, "🌙 Уже 18:00 по Киеву.\n🚫 СТОП ТРЕЙД! Лучше завершить торговлю.")
-
 
 async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
     df = get_market_data(SYMBOL)
@@ -143,13 +116,15 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
     if direction != "WAIT" and confidence >= 80:
         for chat_id in users_to_monitor:
             await context.bot.send_message(chat_id,
-                                           f"📢 Обнаружена возможность!\nСигнал: {direction}\nПара: {SYMBOL}\nУверенность: {confidence}%")
+                f"📢 Возможность для сделки!\nСигнал: {direction}\nПара: {SYMBOL}\nУверенность: {confidence}%")
 
-
-if __name__ == '__main__':
+# === Запуск бота ===
+if name == '__main__':
+    logging.basicConfig(level=logging.INFO)
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_daily(morning_analysis, time(hour=8, minute=0, tzinfo=kiev_tz))
